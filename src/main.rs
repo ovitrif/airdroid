@@ -110,6 +110,7 @@ fn run() -> Result<()> {
     let args = Args::parse();
     let timeout = Duration::from_secs(args.timeout);
 
+    ui::title("airadb", "Android wireless debugging companion");
     ui::status("Checking ADB...");
     let adb = Adb::resolve(args.adb.clone())?;
     adb.version()?;
@@ -126,7 +127,7 @@ fn run() -> Result<()> {
         StartupDeviceChoice::Close => return Ok(()),
     };
 
-    ui::status(format!("Connected to {}", phone.display_name));
+    ui::success(format!("Connected to {}", phone.display_name));
     handle_connected_phone(&phone, &args)
 }
 
@@ -156,7 +157,7 @@ fn connected_phone_menu(phone: &ConnectedPhone, args: &Args) -> Result<()> {
 fn start_scrcpy_background(phone: &ConnectedPhone, args: &Args) -> Result<()> {
     let scrcpy = resolve_scrcpy(args)?;
     let pid = scrcpy.launch_background(&phone.serial)?;
-    ui::status(format!("Started scrcpy in the background (pid {pid})."));
+    ui::success(format!("Started scrcpy in the background (pid {pid})."));
     Ok(())
 }
 
@@ -177,7 +178,7 @@ fn startup_device_choice(adb: &Adb) -> Result<StartupDeviceChoice> {
         0 => Ok(StartupDeviceChoice::PairNew),
         1 => {
             let phone = ready_phones[0].clone();
-            ui::status(format!(
+            ui::success(format!(
                 "ADB is already connected to {}.",
                 phone.display_name
             ));
@@ -253,7 +254,7 @@ fn warn_if_mdns_check_fails(adb: &Adb) {
 fn reset_adb_server(adb: &Adb) -> Result<()> {
     ui::status("Resetting local ADB server...");
     adb.reset_server()?;
-    ui::status("ADB server restarted.");
+    ui::success("ADB server restarted.");
     Ok(())
 }
 
@@ -263,7 +264,7 @@ fn retrying_pairing_flow(adb: &Adb, timeout: Duration) -> Result<ConnectedPhone>
             Ok(phone) => return Ok(phone),
             Err(error) => {
                 if ui::is_cancelled(&error) {
-                    ui::status("Pairing cancelled.");
+                    ui::success("Pairing cancelled.");
                 } else {
                     ui::error(format!("{error:#}"));
                 }
@@ -320,19 +321,27 @@ fn manual_connect_device(
     baseline_devices: &HashSet<String>,
     timeout: Duration,
 ) -> Result<adb::AdbDevice> {
-    ui::status("On your Android phone:");
-    ui::status("Go back to the main Wireless debugging screen.");
-    ui::status("Copy the value shown as \"IP address & Port\".");
+    ui::section(
+        "Manual connection",
+        [
+            "On your Android phone, go back to the main Wireless debugging screen.",
+            "Copy the value shown as \"IP address & Port\".",
+        ],
+    );
 
     let endpoint = prompt_endpoint("Enter phone IP:port")?;
     connect_to_endpoint(adb, &endpoint, baseline_devices, timeout)
 }
 
 fn pairing_code_flow(adb: &Adb, timeout: Duration) -> Result<ConnectedPhone> {
-    ui::status("On your Android phone:");
-    ui::status("Go to Developer options -> Wireless debugging.");
-    ui::status("Tap \"Pair device with pairing code\".");
-    ui::status("Enter the pairing IP:port and pairing code shown on the phone.");
+    ui::section(
+        "Pair with pairing code",
+        [
+            "On your Android phone, go to Developer options -> Wireless debugging.",
+            "Tap \"Pair device with pairing code\".",
+            "Enter the pairing IP:port and pairing code shown on the phone.",
+        ],
+    );
 
     let pairing_endpoint = prompt_endpoint("Enter pairing IP:port")?;
     let pairing_code = ui::prompt_required("Enter pairing code")?;
@@ -340,9 +349,14 @@ fn pairing_code_flow(adb: &Adb, timeout: Duration) -> Result<ConnectedPhone> {
     ui::status(format!("Pairing with {pairing_endpoint}..."));
     adb.pair(&pairing_endpoint, &pairing_code)?;
 
-    ui::status("Pairing succeeded.");
-    ui::status("Close the pairing-code dialog on the phone.");
-    ui::status("On the main Wireless debugging screen, copy \"IP address & Port\".");
+    ui::success("Pairing succeeded.");
+    ui::section(
+        "Connect paired phone",
+        [
+            "Close the pairing-code dialog on the phone.",
+            "On the main Wireless debugging screen, copy \"IP address & Port\".",
+        ],
+    );
 
     let connect_endpoint = prompt_endpoint("Enter phone IP:port")?;
     let baseline_devices = adb::ready_device_serials(&adb.devices().unwrap_or_default());
@@ -362,7 +376,7 @@ fn prompt_endpoint(label: &str) -> Result<String> {
             return Ok(endpoint);
         }
 
-        ui::status("Use the full value shown on the phone, for example 192.168.68.54:37123.");
+        ui::warn("Use the full value shown on the phone, for example 192.168.68.54:37123.");
     }
 }
 
@@ -415,7 +429,7 @@ fn wait_for_ready_device(
             baseline_devices,
         ) {
             countdown.finish();
-            ui::status(format!("ADB device is ready: {}", device.display_name()));
+            ui::success(format!("ADB device is ready: {}", device.display_name()));
             return Ok(device);
         }
 
@@ -436,11 +450,14 @@ fn pair_and_connect(adb: &Adb, timeout: Duration) -> Result<ConnectedPhone> {
     let baseline_devices = adb::ready_device_serials(&adb.devices().unwrap_or_default());
     let qr = PairingQr::generate();
 
-    ui::status("On your Android phone:");
-    ui::status("Go to Developer options -> Wireless debugging.");
-    ui::status("Tap \"Pair device with QR code\".");
-    ui::status("Scan the QR code below.");
-    ui::blank_line();
+    ui::section(
+        "Pair with QR code",
+        [
+            "On your Android phone, go to Developer options -> Wireless debugging.",
+            "Tap \"Pair device with QR code\".",
+            "Scan the QR code below.",
+        ],
+    );
     ui::print_qr(&qr.render_terminal()?);
     ui::blank_line();
     ui::status(ui::CANCEL_HINT);
@@ -450,7 +467,7 @@ fn pair_and_connect(adb: &Adb, timeout: Duration) -> Result<ConnectedPhone> {
         PairingWaitOutcome::AlreadyConnected(phone) => return Ok(phone),
     };
 
-    ui::status("Phone found. Completing ADB pairing...");
+    ui::success("Phone found. Completing ADB pairing...");
     adb.pair(&pairing_address, &qr.secret)?;
 
     ui::status("Looking for the wireless debugging connection endpoint...");
@@ -533,7 +550,7 @@ fn wait_for_pairing_endpoint(
         match dnssd::discover_pairing_endpoint(instance, Duration::from_secs(2)) {
             Ok(Some(endpoint)) => {
                 countdown.finish();
-                ui::status("Phone found through macOS Bonjour.");
+                ui::success("Phone found through macOS Bonjour.");
                 return Ok(PairingWaitOutcome::PairingEndpoint(endpoint));
             }
             Ok(None) => {}
@@ -567,7 +584,7 @@ fn already_connected_phone_choice(
         0 => Ok(None),
         1 => {
             let phone = ready_phones[0].clone();
-            ui::status(format!(
+            ui::success(format!(
                 "ADB already sees {}; skipping QR scan.",
                 phone.display_name
             ));
@@ -622,7 +639,7 @@ fn connect_and_wait_for_device(
             adb::matching_ready_device(&ready_devices, &expected_serial, baseline_devices)
         {
             countdown.finish();
-            ui::status(format!("ADB device is ready: {}", device.display_name()));
+            ui::success(format!("ADB device is ready: {}", device.display_name()));
             return Ok(device);
         }
 

@@ -2,7 +2,7 @@
 
 Interactive Android wireless debugging pairing for macOS.
 
-`airadb` wraps the ADB wireless debugging flow so you do not have to remember the pairing and connect commands. It shows a QR code, watches ADB and Bonjour for the phone, falls back to manual `IP:port` entry when Android exposes a stale endpoint, and can launch `scrcpy` after the device is ready.
+`airadb` wraps the ADB wireless debugging flow so you do not have to remember the pairing and connect commands. It guides you through a progressive terminal flow with QR pairing, live waits, retry options, and manual fallbacks when Android exposes a stale endpoint. Once the phone is ready, it can launch `scrcpy`.
 
 ## Install
 
