@@ -11,6 +11,12 @@ pub struct Scrcpy {
     path: PathBuf,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScrcpyRunMode {
+    Background,
+    Foreground,
+}
+
 impl Scrcpy {
     pub fn resolve(override_path: Option<PathBuf>, skip_check: bool) -> Result<Self> {
         let path = if skip_check {
@@ -36,16 +42,27 @@ impl Scrcpy {
     }
 
     pub fn launch_background(&self, serial: &str, options: &ScrcpyOptions) -> Result<u32> {
-        let child = self.spawn_background(serial, options)?;
+        let child = self.spawn(serial, options, ScrcpyRunMode::Background)?;
         Ok(child.id())
     }
 
-    pub fn spawn_background(&self, serial: &str, options: &ScrcpyOptions) -> Result<Child> {
-        let child = Command::new(&self.path)
-            .args(default_args(serial, options))
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+    pub fn spawn(
+        &self,
+        serial: &str,
+        options: &ScrcpyOptions,
+        mode: ScrcpyRunMode,
+    ) -> Result<Child> {
+        let mut command = Command::new(&self.path);
+        command.args(default_args(serial, options));
+
+        if mode == ScrcpyRunMode::Background {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+        }
+
+        let child = command
             .spawn()
             .with_context(|| format!("failed to run {}", self.path.display()))?;
         Ok(child)

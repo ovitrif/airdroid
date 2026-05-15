@@ -7,6 +7,7 @@ mod ui;
 
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::process::Child;
 use std::process::ExitCode;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -15,7 +16,7 @@ use adb::Adb;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use qr::PairingQr;
-use scrcpy::{Scrcpy, ScrcpyOptions};
+use scrcpy::{Scrcpy, ScrcpyOptions, ScrcpyRunMode};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -74,6 +75,40 @@ struct Args {
         help = "Window title passed to scrcpy"
     )]
     window_title: String,
+
+    #[arg(
+        long,
+        help = "Keep supervising wireless ADB and reconnect when the transport drops"
+    )]
+    watch: bool,
+
+    #[arg(
+        long,
+        help = "Convenience mode: background scrcpy, watch reconnect, keep awake and Wi-Fi diagnostics"
+    )]
+    stable: bool,
+
+    #[arg(
+        long,
+        default_value_t = 5,
+        value_name = "SECONDS",
+        help = "Seconds between ADB keepalive checks in watch mode"
+    )]
+    keepalive_interval: u64,
+
+    #[arg(
+        long,
+        default_value_t = 2,
+        value_name = "COUNT",
+        help = "Consecutive failed keepalives before reconnecting"
+    )]
+    keepalive_failures: u8,
+
+    #[arg(long, help = "Ask Android to keep the screen awake after connecting")]
+    keep_screen_awake: bool,
+
+    #[arg(long, help = "Print Wi-Fi status after connecting and when it changes")]
+    wifi_doctor: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -100,12 +135,21 @@ enum ScrcpyLaunchMode {
     Foreground,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectedAction {
+    StartBackground,
+    StartForeground,
+    Close,
+}
+
 impl Args {
     fn scrcpy_launch_mode(&self) -> ScrcpyLaunchMode {
         if self.background {
             ScrcpyLaunchMode::Background
         } else if self.foreground {
             ScrcpyLaunchMode::Foreground
+        } else if self.stable {
+            ScrcpyLaunchMode::Background
         } else {
             ScrcpyLaunchMode::Menu
         }
@@ -118,6 +162,26 @@ impl Args {
             window_title: self.window_title.clone(),
             ..ScrcpyOptions::default()
         }
+    }
+
+    fn watch_enabled(&self) -> bool {
+        self.watch || self.stable
+    }
+
+    fn keep_screen_awake_enabled(&self) -> bool {
+        self.keep_screen_awake || self.stable
+    }
+
+    fn wifi_doctor_enabled(&self) -> bool {
+        self.wifi_doctor || self.stable
+    }
+
+    fn keepalive_interval(&self) -> Duration {
+        Duration::from_secs(self.keepalive_interval.max(1))
+    }
+
+    fn keepalive_failures(&self) -> u8 {
+        self.keepalive_failures.max(1)
     }
 }
 
@@ -154,29 +218,66 @@ fn run() -> Result<()> {
     };
 
     ui::success(format!("Connected to {}", phone.display_name));
-    handle_connected_phone(&phone, &args)
+    prepare_connected_phone(&adb, &phone, &args);
+    handle_connected_phone(&adb, &phone, &args)
 }
 
-fn handle_connected_phone(phone: &ConnectedPhone, args: &Args) -> Result<()> {
-    match args.scrcpy_launch_mode() {
-        ScrcpyLaunchMode::Menu => connected_phone_menu(phone, args),
-        ScrcpyLaunchMode::Background => start_scrcpy_background(phone, args),
-        ScrcpyLaunchMode::Foreground => start_scrcpy_foreground(phone, args),
+fn prepare_connected_phone(adb: &Adb, phone: &ConnectedPhone, args: &Args) {
+    if args.keep_screen_awake_enabled() {
+        match adb.stay_awake(&phone.serial) {
+            Ok(()) => ui::success("Requested Android stay-awake mode."),
+            Err(error) => ui::warn(format!(
+                "could not enable Android stay-awake mode: {error:#}"
+            )),
+        }
+    }
+
+    if args.wifi_doctor_enabled() {
+        let mut last_wifi_status = None;
+        report_wifi_status(adb, &phone.serial, &mut last_wifi_status);
     }
 }
 
-fn connected_phone_menu(phone: &ConnectedPhone, args: &Args) -> Result<()> {
-    loop {
-        match ui::menu(&[
-            "Start scrcpy in background and close",
-            "Start scrcpy",
-            "Close",
-        ])? {
-            1 => return start_scrcpy_background(phone, args),
-            2 => start_scrcpy_foreground(phone, args)?,
-            3 => return Ok(()),
-            _ => unreachable!("ui::menu only returns a valid option"),
-        }
+fn handle_connected_phone(adb: &Adb, phone: &ConnectedPhone, args: &Args) -> Result<()> {
+    let action = connected_phone_action(args)?;
+
+    if args.watch_enabled() {
+        return match action {
+            ConnectedAction::StartBackground => {
+                watch_connected_phone(adb, phone, args, Some(ScrcpyRunMode::Background))
+            }
+            ConnectedAction::StartForeground => {
+                watch_connected_phone(adb, phone, args, Some(ScrcpyRunMode::Foreground))
+            }
+            ConnectedAction::Close => Ok(()),
+        };
+    }
+
+    match action {
+        ConnectedAction::StartBackground => start_scrcpy_background(phone, args),
+        ConnectedAction::StartForeground => start_scrcpy_foreground(phone, args),
+        ConnectedAction::Close => Ok(()),
+    }
+}
+
+fn connected_phone_action(args: &Args) -> Result<ConnectedAction> {
+    match args.scrcpy_launch_mode() {
+        ScrcpyLaunchMode::Background => return Ok(ConnectedAction::StartBackground),
+        ScrcpyLaunchMode::Foreground => return Ok(ConnectedAction::StartForeground),
+        ScrcpyLaunchMode::Menu => {}
+    }
+
+    let background_label = if args.watch_enabled() {
+        "Start scrcpy in background and watch"
+    } else {
+        "Start scrcpy in background and close"
+    };
+
+    match ui::menu(&[background_label, "Start scrcpy", "Close"])? {
+        1 => Ok(ConnectedAction::StartBackground),
+        2 => Ok(ConnectedAction::StartForeground),
+        3 => Ok(ConnectedAction::Close),
+        _ => unreachable!("ui::menu only returns a valid option"),
     }
 }
 
@@ -190,6 +291,199 @@ fn start_scrcpy_background(phone: &ConnectedPhone, args: &Args) -> Result<()> {
 fn start_scrcpy_foreground(phone: &ConnectedPhone, args: &Args) -> Result<()> {
     let scrcpy = resolve_scrcpy(args)?;
     scrcpy.launch(&phone.serial, &args.scrcpy_options())
+}
+
+fn watch_connected_phone(
+    adb: &Adb,
+    phone: &ConnectedPhone,
+    args: &Args,
+    scrcpy_mode: Option<ScrcpyRunMode>,
+) -> Result<()> {
+    ui::section(
+        "Watch mode",
+        [
+            "Sending ADB keepalives to detect stale wireless transports.",
+            "When the device drops, airadb tries adb reconnect and mDNS endpoints.",
+            "Press either ⌃ + C, ESC, C or X to stop watching.",
+        ],
+    );
+
+    let scrcpy = if scrcpy_mode.is_some() {
+        Some(resolve_scrcpy(args)?)
+    } else {
+        None
+    };
+    let scrcpy_options = args.scrcpy_options();
+    let mut serial = phone.serial.clone();
+    let mut child = match (&scrcpy, scrcpy_mode) {
+        (Some(scrcpy), Some(mode)) => Some(spawn_supervised_scrcpy(
+            scrcpy,
+            &serial,
+            &scrcpy_options,
+            mode,
+        )?),
+        _ => None,
+    };
+    let mut failed_keepalives = 0;
+    let mut last_wifi_status = None;
+
+    loop {
+        if let Some(scrcpy_child) = child.as_mut() {
+            if let Some(status) = scrcpy_child
+                .try_wait()
+                .context("failed to check scrcpy status")?
+            {
+                ui::warn(format!(
+                    "scrcpy exited with status {status}; it will restart when ADB is ready."
+                ));
+                child = None;
+            }
+        }
+
+        match adb.keepalive(&serial) {
+            Ok(()) => {
+                if failed_keepalives > 0 {
+                    ui::success("ADB keepalive recovered.");
+                }
+
+                failed_keepalives = 0;
+
+                if args.wifi_doctor_enabled() {
+                    report_wifi_status(adb, &serial, &mut last_wifi_status);
+                }
+
+                if child.is_none() {
+                    if let (Some(scrcpy), Some(mode)) = (&scrcpy, scrcpy_mode) {
+                        child = Some(spawn_supervised_scrcpy(
+                            scrcpy,
+                            &serial,
+                            &scrcpy_options,
+                            mode,
+                        )?);
+                    }
+                }
+            }
+            Err(error) => {
+                failed_keepalives += 1;
+                ui::warn(format!(
+                    "ADB keepalive failed ({failed_keepalives}/{}): {error:#}",
+                    args.keepalive_failures()
+                ));
+
+                if failed_keepalives >= args.keepalive_failures() {
+                    match reconnect_watched_phone(adb, &serial) {
+                        Ok(reconnected) => {
+                            serial = reconnected.serial;
+                            failed_keepalives = 0;
+                            last_wifi_status = None;
+                            ui::success(format!(
+                                "Watch mode reconnected to {}",
+                                reconnected.display_name
+                            ));
+                        }
+                        Err(reconnect_error) => {
+                            ui::warn(format!("automatic reconnect failed: {reconnect_error:#}"));
+                        }
+                    }
+                }
+            }
+        }
+
+        ui::sleep_or_cancel(args.keepalive_interval())?;
+    }
+}
+
+fn spawn_supervised_scrcpy(
+    scrcpy: &Scrcpy,
+    serial: &str,
+    options: &ScrcpyOptions,
+    mode: ScrcpyRunMode,
+) -> Result<Child> {
+    let child = scrcpy.spawn(serial, options, mode)?;
+    ui::success(format!("Started supervised scrcpy (pid {}).", child.id()));
+    Ok(child)
+}
+
+fn reconnect_watched_phone(adb: &Adb, current_serial: &str) -> Result<ConnectedPhone> {
+    ui::status("Trying to reconnect wireless ADB...");
+    let _ = adb.reconnect_offline();
+
+    if let Some(phone) = ready_phone_matching(adb, current_serial)? {
+        return Ok(phone);
+    }
+
+    let timeout = Duration::from_secs(10);
+    let baseline_devices = HashSet::new();
+
+    if is_plausible_endpoint(current_serial) {
+        if let Ok(device) = connect_to_endpoint(adb, current_serial, &baseline_devices, timeout) {
+            return Ok(ConnectedPhone {
+                serial: device.serial.clone(),
+                display_name: device.display_name(),
+            });
+        }
+    }
+
+    for endpoint in reconnect_endpoints(adb, current_serial) {
+        match connect_to_endpoint(adb, &endpoint, &baseline_devices, timeout) {
+            Ok(device) => {
+                return Ok(ConnectedPhone {
+                    serial: device.serial.clone(),
+                    display_name: device.display_name(),
+                });
+            }
+            Err(error) => ui::warn(format!("reconnect endpoint {endpoint} failed: {error:#}")),
+        }
+    }
+
+    bail!("no reconnectable wireless debugging endpoint was found")
+}
+
+fn ready_phone_matching(adb: &Adb, expected_serial: &str) -> Result<Option<ConnectedPhone>> {
+    let baseline_devices = HashSet::new();
+    let devices = adb.devices()?;
+
+    Ok(
+        adb::matching_ready_device(&devices, expected_serial, &baseline_devices).map(|device| {
+            ConnectedPhone {
+                serial: device.serial.clone(),
+                display_name: device.display_name(),
+            }
+        }),
+    )
+}
+
+fn reconnect_endpoints(adb: &Adb, current_serial: &str) -> Vec<String> {
+    let host = adb::endpoint_host(current_serial);
+    let services = adb.mdns_services().unwrap_or_default();
+    let connect_endpoints: Vec<String> = services
+        .iter()
+        .filter(|service| service.is_connect_service())
+        .map(|service| service.address.clone())
+        .collect();
+
+    let same_host: Vec<String> = connect_endpoints
+        .iter()
+        .filter(|endpoint| adb::endpoint_host(endpoint) == host)
+        .cloned()
+        .collect();
+
+    if same_host.is_empty() {
+        connect_endpoints
+    } else {
+        same_host
+    }
+}
+
+fn report_wifi_status(adb: &Adb, serial: &str, last_status: &mut Option<String>) {
+    match adb.wifi_status(serial) {
+        Ok(status) if last_status.as_deref() != Some(status.as_str()) => {
+            ui::status(format!("Wi-Fi: {status}"));
+            *last_status = Some(status);
+        }
+        Ok(_) => {}
+        Err(error) => ui::warn(format!("could not read Wi-Fi status: {error:#}")),
+    }
 }
 
 fn resolve_scrcpy(args: &Args) -> Result<Scrcpy> {
@@ -996,6 +1290,32 @@ mod tests {
             foreground_args.scrcpy_launch_mode(),
             ScrcpyLaunchMode::Foreground
         );
+    }
+
+    #[test]
+    fn stable_mode_enables_supervision_defaults() {
+        let args = Args::try_parse_from(["airadb", "--stable"]).unwrap();
+
+        assert_eq!(args.scrcpy_launch_mode(), ScrcpyLaunchMode::Background);
+        assert!(args.watch_enabled());
+        assert!(args.keep_screen_awake_enabled());
+        assert!(args.wifi_doctor_enabled());
+    }
+
+    #[test]
+    fn normalizes_keepalive_settings() {
+        let args = Args::try_parse_from([
+            "airadb",
+            "--watch",
+            "--keepalive-interval",
+            "0",
+            "--keepalive-failures",
+            "0",
+        ])
+        .unwrap();
+
+        assert_eq!(args.keepalive_interval(), Duration::from_secs(1));
+        assert_eq!(args.keepalive_failures(), 1);
     }
 
     #[test]
