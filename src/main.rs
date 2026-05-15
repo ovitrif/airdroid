@@ -15,7 +15,7 @@ use adb::Adb;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use qr::PairingQr;
-use scrcpy::Scrcpy;
+use scrcpy::{Scrcpy, ScrcpyOptions};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -57,6 +57,23 @@ struct Args {
         help = "Start scrcpy in the foreground once connected and skip the menu"
     )]
     foreground: bool,
+
+    #[arg(
+        long,
+        help = "Use scrcpy's regular decorated window instead of a borderless Pixel-style window"
+    )]
+    plain_window: bool,
+
+    #[arg(long, help = "Keep the scrcpy window above other windows")]
+    always_on_top: bool,
+
+    #[arg(
+        long,
+        default_value = "Pixel 10 Pro",
+        value_name = "TEXT",
+        help = "Window title passed to scrcpy"
+    )]
+    window_title: String,
 }
 
 #[derive(Debug, Clone)]
@@ -91,6 +108,15 @@ impl Args {
             ScrcpyLaunchMode::Foreground
         } else {
             ScrcpyLaunchMode::Menu
+        }
+    }
+
+    fn scrcpy_options(&self) -> ScrcpyOptions {
+        ScrcpyOptions {
+            borderless: !self.plain_window,
+            always_on_top: self.always_on_top,
+            window_title: self.window_title.clone(),
+            ..ScrcpyOptions::default()
         }
     }
 }
@@ -156,14 +182,14 @@ fn connected_phone_menu(phone: &ConnectedPhone, args: &Args) -> Result<()> {
 
 fn start_scrcpy_background(phone: &ConnectedPhone, args: &Args) -> Result<()> {
     let scrcpy = resolve_scrcpy(args)?;
-    let pid = scrcpy.launch_background(&phone.serial)?;
+    let pid = scrcpy.launch_background(&phone.serial, &args.scrcpy_options())?;
     ui::success(format!("Started scrcpy in the background (pid {pid})."));
     Ok(())
 }
 
 fn start_scrcpy_foreground(phone: &ConnectedPhone, args: &Args) -> Result<()> {
     let scrcpy = resolve_scrcpy(args)?;
-    scrcpy.launch(&phone.serial)
+    scrcpy.launch(&phone.serial, &args.scrcpy_options())
 }
 
 fn resolve_scrcpy(args: &Args) -> Result<Scrcpy> {
@@ -969,6 +995,31 @@ mod tests {
         assert_eq!(
             foreground_args.scrcpy_launch_mode(),
             ScrcpyLaunchMode::Foreground
+        );
+    }
+
+    #[test]
+    fn builds_scrcpy_options_from_args() {
+        let default_args = Args::try_parse_from(["airadb"]).unwrap();
+        assert_eq!(default_args.scrcpy_options(), ScrcpyOptions::default());
+
+        let custom_args = Args::try_parse_from([
+            "airadb",
+            "--plain-window",
+            "--always-on-top",
+            "--window-title",
+            "Ovi Pixel",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            custom_args.scrcpy_options(),
+            ScrcpyOptions {
+                borderless: false,
+                always_on_top: true,
+                window_title: "Ovi Pixel".to_string(),
+                ..ScrcpyOptions::default()
+            }
         );
     }
 
