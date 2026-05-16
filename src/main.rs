@@ -104,7 +104,10 @@ struct Args {
     )]
     keepalive_failures: u8,
 
-    #[arg(long, help = "Ask Android to keep the screen awake after connecting")]
+    #[arg(
+        long,
+        help = "Ask Android to keep the screen awake even when not launching scrcpy"
+    )]
     keep_screen_awake: bool,
 
     #[arg(long, help = "Print Wi-Fi status after connecting and when it changes")]
@@ -140,6 +143,12 @@ enum ConnectedAction {
     StartBackground,
     StartForeground,
     Close,
+}
+
+impl ConnectedAction {
+    fn starts_scrcpy(self) -> bool {
+        matches!(self, Self::StartBackground | Self::StartForeground)
+    }
 }
 
 impl Args {
@@ -218,12 +227,18 @@ fn run() -> Result<()> {
     };
 
     ui::success(format!("Connected to {}", phone.display_name));
-    prepare_connected_phone(&adb, &phone, &args);
-    handle_connected_phone(&adb, &phone, &args)
+    let action = connected_phone_action(&args)?;
+    prepare_connected_phone(&adb, &phone, &args, action);
+    handle_connected_phone(&adb, &phone, &args, action)
 }
 
-fn prepare_connected_phone(adb: &Adb, phone: &ConnectedPhone, args: &Args) {
-    if args.keep_screen_awake_enabled() {
+fn prepare_connected_phone(
+    adb: &Adb,
+    phone: &ConnectedPhone,
+    args: &Args,
+    action: ConnectedAction,
+) {
+    if should_request_stay_awake(args, action) {
         match adb.stay_awake(&phone.serial) {
             Ok(()) => ui::success("Requested Android stay-awake mode."),
             Err(error) => ui::warn(format!(
@@ -238,9 +253,12 @@ fn prepare_connected_phone(adb: &Adb, phone: &ConnectedPhone, args: &Args) {
     }
 }
 
-fn handle_connected_phone(adb: &Adb, phone: &ConnectedPhone, args: &Args) -> Result<()> {
-    let action = connected_phone_action(args)?;
-
+fn handle_connected_phone(
+    adb: &Adb,
+    phone: &ConnectedPhone,
+    args: &Args,
+    action: ConnectedAction,
+) -> Result<()> {
     if args.watch_enabled() {
         return match action {
             ConnectedAction::StartBackground => {
@@ -258,6 +276,10 @@ fn handle_connected_phone(adb: &Adb, phone: &ConnectedPhone, args: &Args) -> Res
         ConnectedAction::StartForeground => start_scrcpy_foreground(phone, args),
         ConnectedAction::Close => Ok(()),
     }
+}
+
+fn should_request_stay_awake(args: &Args, action: ConnectedAction) -> bool {
+    args.keep_screen_awake_enabled() || action.starts_scrcpy()
 }
 
 fn connected_phone_action(args: &Args) -> Result<ConnectedAction> {
@@ -1300,6 +1322,28 @@ mod tests {
         assert!(args.watch_enabled());
         assert!(args.keep_screen_awake_enabled());
         assert!(args.wifi_doctor_enabled());
+    }
+
+    #[test]
+    fn scrcpy_actions_request_stay_awake_by_default() {
+        let args = Args::try_parse_from(["airadb"]).unwrap();
+
+        assert!(should_request_stay_awake(
+            &args,
+            ConnectedAction::StartBackground
+        ));
+        assert!(should_request_stay_awake(
+            &args,
+            ConnectedAction::StartForeground
+        ));
+        assert!(!should_request_stay_awake(&args, ConnectedAction::Close));
+    }
+
+    #[test]
+    fn explicit_keep_screen_awake_applies_without_scrcpy() {
+        let args = Args::try_parse_from(["airadb", "--keep-screen-awake"]).unwrap();
+
+        assert!(should_request_stay_awake(&args, ConnectedAction::Close));
     }
 
     #[test]
