@@ -6,25 +6,36 @@ mod scrcpy;
 mod ui;
 
 use std::collections::HashSet;
-use std::path::PathBuf;
-use std::process::Child;
-use std::process::ExitCode;
+use std::env;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command as ProcessCommand, ExitCode};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use adb::Adb;
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 use qr::PairingQr;
 use scrcpy::{Scrcpy, ScrcpyOptions, ScrcpyRunMode};
+
+const BINARY_NAME: &str = "airadb";
+const ALIAS_NAME: &str = "aw";
+const ALIAS_MEMORY: &str = "aw = android wifi";
 
 #[derive(Debug, Parser)]
 #[command(
     name = "airadb",
     version,
-    about = "Interactive QR pairing for Android wireless debugging."
+    about = "Interactive QR pairing for Android wireless debugging.",
+    after_help = "Tip: `aw` is the short alias for airadb: android wifi."
 )]
 struct Args {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+
     #[arg(long, value_name = "PATH", help = "Path to adb")]
     adb: Option<PathBuf>,
 
@@ -112,6 +123,67 @@ struct Args {
 
     #[arg(long, help = "Print Wi-Fi status after connecting and when it changes")]
     wifi_doctor: bool,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum CliCommand {
+    #[command(about = "Print shell completions")]
+    Completions(CompletionArgs),
+
+    #[command(
+        about = "Install the aw alias and zsh completions",
+        after_help = "Remember: aw = android wifi."
+    )]
+    InstallShell(InstallShellArgs),
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct CompletionArgs {
+    #[arg(value_enum, default_value_t = CompletionShell::Zsh)]
+    shell: CompletionShell,
+
+    #[arg(long, value_enum, default_value_t = CompletionName::Airadb)]
+    name: CompletionName,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct InstallShellArgs {
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Directory where the aw alias should be installed"
+    )]
+    bin_dir: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Directory where zsh completion files should be installed"
+    )]
+    zsh_completion_dir: Option<PathBuf>,
+
+    #[arg(long, help = "Replace an existing aw file or symlink")]
+    force: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CompletionShell {
+    Zsh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CompletionName {
+    Airadb,
+    Aw,
+}
+
+impl CompletionName {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Airadb => BINARY_NAME,
+            Self::Aw => ALIAS_NAME,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -207,6 +279,11 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let args = Args::parse();
+
+    if let Some(command) = args.command.as_ref() {
+        return handle_cli_command(command);
+    }
+
     let timeout = Duration::from_secs(args.timeout);
 
     ui::title("airadb", "Android wireless debugging companion");
@@ -230,6 +307,246 @@ fn run() -> Result<()> {
     let action = connected_phone_action(&args)?;
     prepare_connected_phone(&adb, &phone, &args, action);
     handle_connected_phone(&adb, &phone, &args, action)
+}
+
+fn handle_cli_command(command: &CliCommand) -> Result<()> {
+    match command {
+        CliCommand::Completions(args) => print_completions(args),
+        CliCommand::InstallShell(args) => install_shell(args),
+    }
+}
+
+fn print_completions(args: &CompletionArgs) -> Result<()> {
+    let mut command = Args::command().bin_name(args.name.as_str());
+    let mut stdout = io::stdout();
+
+    match args.shell {
+        CompletionShell::Zsh => {
+            clap_complete::generate(Shell::Zsh, &mut command, args.name.as_str(), &mut stdout);
+        }
+    }
+
+    Ok(())
+}
+
+fn install_shell(args: &InstallShellArgs) -> Result<()> {
+    let airadb_path = airadb_binary_path(args.bin_dir.as_deref())?;
+    let bin_dir = args
+        .bin_dir
+        .clone()
+        .or_else(|| airadb_path.parent().map(Path::to_path_buf))
+        .context("could not resolve the airadb binary directory")?;
+    fs::create_dir_all(&bin_dir)
+        .with_context(|| format!("failed to create {}", bin_dir.display()))?;
+
+    let alias_path = bin_dir.join(ALIAS_NAME);
+    install_alias(&airadb_path, &alias_path, args.force)?;
+
+    let completion_dir = zsh_completion_dir(args.zsh_completion_dir.as_deref())?;
+    install_zsh_completion(CompletionName::Airadb, &completion_dir)?;
+    install_zsh_completion(CompletionName::Aw, &completion_dir)?;
+
+    ui::success(format!(
+        "Installed `{ALIAS_NAME}` alias at {} ({ALIAS_MEMORY}).",
+        alias_path.display()
+    ));
+    ui::success(format!(
+        "Installed zsh completions in {}.",
+        completion_dir.display()
+    ));
+
+    if !zsh_fpath_contains(&completion_dir) {
+        ui::warn(format!(
+            "zsh may not load completions until this is in fpath: fpath=({} $fpath)",
+            shell_quote(&completion_dir)
+        ));
+    }
+
+    Ok(())
+}
+
+fn airadb_binary_path(bin_dir: Option<&Path>) -> Result<PathBuf> {
+    if let Some(bin_dir) = bin_dir {
+        let installed_path = bin_dir.join(BINARY_NAME);
+        if installed_path.exists() {
+            return Ok(installed_path);
+        }
+    }
+
+    env::current_exe().context("could not resolve the current executable path")
+}
+
+fn install_alias(airadb_path: &Path, alias_path: &Path, force: bool) -> Result<()> {
+    if symlink_metadata(alias_path).is_some() {
+        if path_points_to(alias_path, airadb_path) {
+            return Ok(());
+        }
+
+        if !force {
+            bail!(
+                "{} already exists. Re-run with --force to replace it.",
+                alias_path.display()
+            );
+        }
+
+        remove_alias(alias_path)?;
+    }
+
+    create_alias_symlink(airadb_path, alias_path)
+        .with_context(|| format!("failed to create {}", alias_path.display()))
+}
+
+fn symlink_metadata(path: &Path) -> Option<fs::Metadata> {
+    fs::symlink_metadata(path).ok()
+}
+
+fn remove_alias(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        bail!("{} is a directory; refusing to replace it", path.display());
+    }
+
+    fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))
+}
+
+#[cfg(unix)]
+fn create_alias_symlink(airadb_path: &Path, alias_path: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(airadb_path, alias_path)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_alias_symlink(airadb_path: &Path, alias_path: &Path) -> Result<()> {
+    fs::copy(airadb_path, alias_path)?;
+    Ok(())
+}
+
+fn path_points_to(path: &Path, target: &Path) -> bool {
+    if let Ok(link_target) = fs::read_link(path) {
+        if link_target == target {
+            return true;
+        }
+
+        if let Some(parent) = path.parent() {
+            if parent.join(link_target) == target {
+                return true;
+            }
+        }
+    }
+
+    match (fs::canonicalize(path), fs::canonicalize(target)) {
+        (Ok(path), Ok(target)) => path == target,
+        _ => false,
+    }
+}
+
+fn zsh_completion_dir(override_dir: Option<&Path>) -> Result<PathBuf> {
+    if let Some(dir) = override_dir {
+        fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        return Ok(dir.to_path_buf());
+    }
+
+    if let Some(dir) = writable_zsh_fpath_dir() {
+        return Ok(dir);
+    }
+
+    let dir = home_dir().join(".zfunc");
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    Ok(dir)
+}
+
+fn writable_zsh_fpath_dir() -> Option<PathBuf> {
+    zsh_fpath_dirs()
+        .into_iter()
+        .find(|path| is_writable_directory(path))
+}
+
+fn zsh_fpath_contains(dir: &Path) -> bool {
+    let canonical_dir = fs::canonicalize(dir).ok();
+
+    zsh_fpath_dirs().iter().any(|entry| {
+        if entry == dir {
+            return true;
+        }
+
+        match (&canonical_dir, fs::canonicalize(entry).ok()) {
+            (Some(dir), Some(entry)) => dir == &entry,
+            _ => false,
+        }
+    })
+}
+
+fn zsh_fpath_dirs() -> Vec<PathBuf> {
+    let Ok(output) = ProcessCommand::new("zsh")
+        .args(["-lc", "print -rC1 -- $fpath"])
+        .output()
+    else {
+        return Vec::new();
+    };
+
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn is_writable_directory(path: &Path) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+
+    let test_path = path.join(format!(".airadb-write-test-{}", std::process::id()));
+
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&test_path)
+    {
+        Ok(_) => {
+            let _ = fs::remove_file(test_path);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn install_zsh_completion(name: CompletionName, dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let file = dir.join(format!("_{}", name.as_str()));
+    fs::write(&file, zsh_completion(name))
+        .with_context(|| format!("failed to write {}", file.display()))
+}
+
+fn zsh_completion(name: CompletionName) -> Vec<u8> {
+    let mut command = Args::command().bin_name(name.as_str());
+    let mut buffer = Vec::new();
+    clap_complete::generate(Shell::Zsh, &mut command, name.as_str(), &mut buffer);
+    buffer
+}
+
+fn home_dir() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn shell_quote(path: &Path) -> String {
+    let value = path.display().to_string();
+
+    if value.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-')
+    }) {
+        return value;
+    }
+
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 fn prepare_connected_phone(
@@ -1390,6 +1707,34 @@ mod tests {
     #[test]
     fn rejects_conflicting_scrcpy_launch_flags() {
         assert!(Args::try_parse_from(["airadb", "--background", "--foreground"]).is_err());
+    }
+
+    #[test]
+    fn parses_shell_integration_commands() {
+        let args = Args::try_parse_from(["airadb", "completions", "zsh", "--name", "aw"]).unwrap();
+
+        match args.command {
+            Some(CliCommand::Completions(args)) => {
+                assert_eq!(args.shell, CompletionShell::Zsh);
+                assert_eq!(args.name, CompletionName::Aw);
+            }
+            _ => panic!("expected completions command"),
+        }
+
+        let args = Args::try_parse_from(["airadb", "install-shell", "--force"]).unwrap();
+
+        match args.command {
+            Some(CliCommand::InstallShell(args)) => assert!(args.force),
+            _ => panic!("expected install-shell command"),
+        }
+    }
+
+    #[test]
+    fn generates_zsh_completion_for_aw_alias() {
+        let completion = String::from_utf8(zsh_completion(CompletionName::Aw)).unwrap();
+
+        assert!(completion.contains("#compdef aw"));
+        assert!(completion.contains("install-shell"));
     }
 
     #[test]

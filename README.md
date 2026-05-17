@@ -16,7 +16,7 @@ Pin a release or install somewhere else:
 
 ```sh
 curl -fsSL https://github.com/ovitrif/airadb/releases/latest/download/install.sh | \
-  AIRADB_INSTALL_TAG=v0.1.4 AIRADB_INSTALL_DIR="$HOME/.local/bin" sh
+  AIRADB_INSTALL_TAG=v0.1.5 AIRADB_INSTALL_DIR="$HOME/.local/bin" sh
 ```
 
 Or build from source:
@@ -33,6 +33,13 @@ After installing, run:
 
 ```sh
 airadb
+```
+
+The installer also sets up `aw` as a short alias for `airadb`. Remember it as
+**android wifi**:
+
+```sh
+aw
 ```
 
 Or from a source checkout:
@@ -62,5 +69,7 @@ airadb --stable # background scrcpy, ADB keepalive, reconnects, stay-awake and W
 airadb --watch --wifi-doctor # supervise wireless ADB and print Wi-Fi changes
 airadb --plain-window --always-on-top --window-title "Pixel 10 Pro"
 airadb --adb /path/to/adb --scrcpy /path/to/scrcpy
+airadb install-shell # install the aw alias and zsh completions
+airadb completions zsh --name aw
 airadb --help
 ```
