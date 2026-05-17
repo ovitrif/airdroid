@@ -159,6 +159,41 @@ impl Adb {
         Ok(output)
     }
 
+    pub fn reconnect_offline(&self) -> Result<CommandResult> {
+        self.run(["reconnect", "offline"])
+    }
+
+    pub fn keepalive(&self, serial: &str) -> Result<()> {
+        ensure_success("adb shell true", self.run(["-s", serial, "shell", "true"])?)?;
+
+        Ok(())
+    }
+
+    pub fn stay_awake(&self, serial: &str) -> Result<()> {
+        ensure_success(
+            "adb shell svc power stayon true",
+            self.run(["-s", serial, "shell", "svc", "power", "stayon", "true"])?,
+        )?;
+
+        Ok(())
+    }
+
+    pub fn wifi_status(&self, serial: &str) -> Result<String> {
+        let output = self.run(["-s", serial, "shell", "cmd", "wifi", "status"])?;
+        let combined = output.combined_output();
+
+        if output.status.success() && !combined.trim().is_empty() {
+            return Ok(summarize_wifi_status(&combined));
+        }
+
+        let output = ensure_success(
+            "adb shell dumpsys wifi",
+            self.run(["-s", serial, "shell", "dumpsys", "wifi"])?,
+        )?;
+
+        Ok(summarize_wifi_status(&output.combined_output()))
+    }
+
     pub fn dump_ui_hierarchy(&self, serial: &str) -> Result<String> {
         let direct_output =
             self.run(["-s", serial, "exec-out", "uiautomator", "dump", "/dev/tty"])?;
@@ -433,6 +468,41 @@ fn fallback_message(output: &str) -> String {
     }
 }
 
+fn summarize_wifi_status(output: &str) -> String {
+    let mut lines = Vec::new();
+
+    for line in output.lines() {
+        let line = line.trim();
+        let lower = line.to_ascii_lowercase();
+
+        if line.is_empty() {
+            continue;
+        }
+
+        if lower.contains("ssid")
+            || lower.contains("bssid")
+            || lower.contains("rssi")
+            || lower.contains("frequency")
+            || lower.contains("link speed")
+            || lower.contains("wifi is")
+            || lower.contains("wi-fi is")
+            || lower.contains("connected")
+        {
+            lines.push(line.to_string());
+        }
+
+        if lines.len() >= 8 {
+            break;
+        }
+    }
+
+    if lines.is_empty() {
+        output.lines().take(6).collect::<Vec<_>>().join(" | ")
+    } else {
+        lines.join(" | ")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -537,5 +607,25 @@ R5CT123ABC device product:foo model:Old_Device device:bar transport_id:1
             .expect("expected matching same-host wireless device");
 
         assert_eq!(matched.serial, "192.168.1.23:40233");
+    }
+
+    #[test]
+    fn summarizes_wifi_status_lines() {
+        let summary = summarize_wifi_status(
+            r#"
+Wifi is enabled
+Random line
+SSID: "Lab"
+BSSID: 12:34:56:78:90:ab
+RSSI: -66
+Frequency: 5180
+Link speed: 433Mbps
+"#,
+        );
+
+        assert_eq!(
+            summary,
+            "Wifi is enabled | SSID: \"Lab\" | BSSID: 12:34:56:78:90:ab | RSSI: -66 | Frequency: 5180 | Link speed: 433Mbps"
+        );
     }
 }

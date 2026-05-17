@@ -6,7 +6,7 @@ use anyhow::{Context, Result, bail};
 use crossterm::cursor;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use crossterm::execute;
-use crossterm::style::{Attribute, Print, SetAttribute};
+use crossterm::style::{Attribute, Color, Print, SetAttribute, Stylize};
 use crossterm::terminal;
 use crossterm::terminal::{Clear, ClearType};
 
@@ -24,15 +24,27 @@ impl std::fmt::Display for Cancelled {
 impl std::error::Error for Cancelled {}
 
 pub fn status(message: impl AsRef<str>) {
-    println!("{}", message.as_ref());
+    println!("{} {}", "◇".with(Color::Green), message.as_ref().bold());
+}
+
+pub fn success(message: impl AsRef<str>) {
+    println!("{} {}", "✓".with(Color::Green), message.as_ref().bold());
 }
 
 pub fn warn(message: impl AsRef<str>) {
-    println!("Warning: {}", message.as_ref());
+    println!(
+        "{} {}",
+        "!".with(Color::Yellow),
+        format!("Warning: {}", message.as_ref()).with(Color::Yellow)
+    );
 }
 
 pub fn error(message: impl AsRef<str>) {
-    eprintln!("\nError: {}", message.as_ref());
+    eprintln!(
+        "\n{} {}",
+        "×".with(Color::Red),
+        format!("Error: {}", message.as_ref()).with(Color::Red)
+    );
 }
 
 pub fn blank_line() {
@@ -41,6 +53,29 @@ pub fn blank_line() {
 
 pub fn print_qr(qr: &str) {
     println!("{qr}");
+}
+
+pub fn title(name: &str, subtitle: &str) {
+    println!(
+        "{} {}",
+        name.with(Color::Green).bold(),
+        subtitle.with(Color::DarkGrey)
+    );
+}
+
+pub fn section<I, S>(title: &str, lines: I)
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    blank_line();
+    println!("{} {}", "◇".with(Color::Green), title.bold());
+
+    for line in lines {
+        println!("{}  {}", "│".with(Color::DarkGrey), line.as_ref());
+    }
+
+    println!("{}", "└".with(Color::DarkGrey));
 }
 
 pub fn cancelled() -> anyhow::Error {
@@ -116,7 +151,11 @@ impl Countdown {
             io::stdout(),
             cursor::MoveToColumn(0),
             Clear(ClearType::CurrentLine),
-            Print(format!("{}: {seconds} seconds remaining...", self.label))
+            Print(format!(
+                "{} {}: {seconds} seconds remaining...",
+                "◇".with(Color::Green),
+                self.label
+            ))
         )?;
         io::stdout().flush().context("failed to flush stdout")?;
 
@@ -149,6 +188,7 @@ pub fn menu(options: &[&str]) -> Result<usize> {
     }
 
     blank_line();
+    status("Choose an action");
 
     if options.len() <= 9 {
         match interactive_menu(options) {
@@ -202,14 +242,16 @@ fn interactive_menu(options: &[&str]) -> Result<usize> {
                 }
                 KeyCode::Enter => {
                     let value = selected + 1;
+                    let option = options[selected];
                     drop(raw_mode);
-                    println!("{value}");
+                    confirm_selection(&mut stdout, option)?;
                     return Ok(value);
                 }
                 KeyCode::Char(character) => {
                     if let Some(value) = selection_from_char(character, options.len()) {
+                        let option = options[value - 1];
                         drop(raw_mode);
-                        println!("{value}");
+                        confirm_selection(&mut stdout, option)?;
                         return Ok(value);
                     }
 
@@ -226,6 +268,18 @@ fn interactive_menu(options: &[&str]) -> Result<usize> {
     }
 }
 
+fn confirm_selection<W: Write>(writer: &mut W, option: &str) -> Result<()> {
+    execute!(
+        writer,
+        Clear(ClearType::CurrentLine),
+        cursor::MoveToColumn(0),
+        Print(format!("{} {option}\r\n", "✓".with(Color::Green)))
+    )?;
+    writer.flush().context("failed to flush stdout")?;
+
+    Ok(())
+}
+
 fn render_interactive_menu<W: Write>(
     writer: &mut W,
     options: &[&str],
@@ -238,22 +292,19 @@ fn render_interactive_menu<W: Write>(
             execute!(
                 writer,
                 SetAttribute(Attribute::Reverse),
-                Print(format!("{}. {option}", index + 1)),
+                Print(format!("› {}. {option}", index + 1)),
                 SetAttribute(Attribute::Reset),
                 Print("\r\n")
             )?;
         } else {
-            execute!(writer, Print(format!("{}. {option}\r\n", index + 1)))?;
+            execute!(writer, Print(format!("  {}. {option}\r\n", index + 1)))?;
         }
     }
 
     execute!(
         writer,
         Clear(ClearType::CurrentLine),
-        Print(format!(
-            "Choose 1-{} (number key, or ↑↓ + Enter): ",
-            options.len()
-        ))
+        Print("Use ↑↓ + Enter, number key, or ESC to cancel: ")
     )?;
     writer.flush().context("failed to flush stdout")?;
 
@@ -280,7 +331,10 @@ fn line_menu(options: &[&str]) -> Result<usize> {
         let input = prompt(&label)?;
 
         match input.trim().parse::<usize>() {
-            Ok(value) if (1..=options.len()).contains(&value) => return Ok(value),
+            Ok(value) if (1..=options.len()).contains(&value) => {
+                success(options[value - 1]);
+                return Ok(value);
+            }
             _ => status("Please enter one of the numbered options."),
         }
     }
@@ -288,7 +342,7 @@ fn line_menu(options: &[&str]) -> Result<usize> {
 
 fn print_options(options: &[&str]) {
     for (index, option) in options.iter().enumerate() {
-        println!("{}. {option}", index + 1);
+        println!("  {}. {option}", index + 1);
     }
 }
 
@@ -330,7 +384,7 @@ fn is_raw_mode_error(error: &anyhow::Error) -> bool {
 }
 
 pub fn prompt(label: &str) -> Result<String> {
-    print!("{label}: ");
+    print!("{} {label}: ", "?".with(Color::Green));
     io::stdout().flush().context("failed to flush stdout")?;
 
     let mut input = String::new();

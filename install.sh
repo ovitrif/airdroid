@@ -63,7 +63,13 @@ main() {
   install -m 755 "${dir}/${BINARY}" "${install_dir}/${BINARY}"
 
   echo "Installed to ${install_dir}/${BINARY}"
-  echo "Run '${BINARY} --help' to get started."
+  if "${install_dir}/${BINARY}" install-shell --bin-dir "$install_dir"; then
+    echo "Installed 'aw' alias (android wifi) and zsh completions when available."
+    echo "Run 'aw' to get started."
+  else
+    echo "Shell integration skipped. Run '${BINARY} install-shell --force' to retry." >&2
+    echo "Run '${BINARY}' to get started."
+  fi
 }
 
 resolve_install_dir() {

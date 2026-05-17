@@ -6,24 +6,36 @@ mod scrcpy;
 mod ui;
 
 use std::collections::HashSet;
-use std::path::PathBuf;
-use std::process::ExitCode;
+use std::env;
+use std::fs;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::process::{Child, Command as ProcessCommand, ExitCode};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use adb::Adb;
 use anyhow::{Context, Result, bail};
-use clap::Parser;
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
 use qr::PairingQr;
-use scrcpy::Scrcpy;
+use scrcpy::{Scrcpy, ScrcpyOptions, ScrcpyRunMode};
+
+const BINARY_NAME: &str = "airadb";
+const ALIAS_NAME: &str = "aw";
+const ALIAS_MEMORY: &str = "aw = android wifi";
 
 #[derive(Debug, Parser)]
 #[command(
     name = "airadb",
     version,
-    about = "Interactive QR pairing for Android wireless debugging."
+    about = "Interactive QR pairing for Android wireless debugging.",
+    after_help = "Tip: `aw` is the short alias for airadb: android wifi."
 )]
 struct Args {
+    #[command(subcommand)]
+    command: Option<CliCommand>,
+
     #[arg(long, value_name = "PATH", help = "Path to adb")]
     adb: Option<PathBuf>,
 
@@ -57,6 +69,121 @@ struct Args {
         help = "Start scrcpy in the foreground once connected and skip the menu"
     )]
     foreground: bool,
+
+    #[arg(
+        long,
+        help = "Use scrcpy's regular decorated window instead of a borderless Pixel-style window"
+    )]
+    plain_window: bool,
+
+    #[arg(long, help = "Keep the scrcpy window above other windows")]
+    always_on_top: bool,
+
+    #[arg(
+        long,
+        default_value = "Pixel 10 Pro",
+        value_name = "TEXT",
+        help = "Window title passed to scrcpy"
+    )]
+    window_title: String,
+
+    #[arg(
+        long,
+        help = "Keep supervising wireless ADB and reconnect when the transport drops"
+    )]
+    watch: bool,
+
+    #[arg(
+        long,
+        help = "Convenience mode: background scrcpy, watch reconnect, keep awake and Wi-Fi diagnostics"
+    )]
+    stable: bool,
+
+    #[arg(
+        long,
+        default_value_t = 5,
+        value_name = "SECONDS",
+        help = "Seconds between ADB keepalive checks in watch mode"
+    )]
+    keepalive_interval: u64,
+
+    #[arg(
+        long,
+        default_value_t = 2,
+        value_name = "COUNT",
+        help = "Consecutive failed keepalives before reconnecting"
+    )]
+    keepalive_failures: u8,
+
+    #[arg(
+        long,
+        help = "Ask Android to keep the screen awake even when not launching scrcpy"
+    )]
+    keep_screen_awake: bool,
+
+    #[arg(long, help = "Print Wi-Fi status after connecting and when it changes")]
+    wifi_doctor: bool,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+enum CliCommand {
+    #[command(about = "Print shell completions")]
+    Completions(CompletionArgs),
+
+    #[command(
+        about = "Install the aw alias and zsh completions",
+        after_help = "Remember: aw = android wifi."
+    )]
+    InstallShell(InstallShellArgs),
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct CompletionArgs {
+    #[arg(value_enum, default_value_t = CompletionShell::Zsh)]
+    shell: CompletionShell,
+
+    #[arg(long, value_enum, default_value_t = CompletionName::Airadb)]
+    name: CompletionName,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+struct InstallShellArgs {
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Directory where the aw alias should be installed"
+    )]
+    bin_dir: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "DIR",
+        help = "Directory where zsh completion files should be installed"
+    )]
+    zsh_completion_dir: Option<PathBuf>,
+
+    #[arg(long, help = "Replace an existing aw file or symlink")]
+    force: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CompletionShell {
+    Zsh,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CompletionName {
+    Airadb,
+    Aw,
+}
+
+impl CompletionName {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Airadb => BINARY_NAME,
+            Self::Aw => ALIAS_NAME,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -83,15 +210,59 @@ enum ScrcpyLaunchMode {
     Foreground,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectedAction {
+    StartBackground,
+    StartForeground,
+    Close,
+}
+
+impl ConnectedAction {
+    fn starts_scrcpy(self) -> bool {
+        matches!(self, Self::StartBackground | Self::StartForeground)
+    }
+}
+
 impl Args {
     fn scrcpy_launch_mode(&self) -> ScrcpyLaunchMode {
         if self.background {
             ScrcpyLaunchMode::Background
         } else if self.foreground {
             ScrcpyLaunchMode::Foreground
+        } else if self.stable {
+            ScrcpyLaunchMode::Background
         } else {
             ScrcpyLaunchMode::Menu
         }
+    }
+
+    fn scrcpy_options(&self) -> ScrcpyOptions {
+        ScrcpyOptions {
+            borderless: !self.plain_window,
+            always_on_top: self.always_on_top,
+            window_title: self.window_title.clone(),
+            ..ScrcpyOptions::default()
+        }
+    }
+
+    fn watch_enabled(&self) -> bool {
+        self.watch || self.stable
+    }
+
+    fn keep_screen_awake_enabled(&self) -> bool {
+        self.keep_screen_awake || self.stable
+    }
+
+    fn wifi_doctor_enabled(&self) -> bool {
+        self.wifi_doctor || self.stable
+    }
+
+    fn keepalive_interval(&self) -> Duration {
+        Duration::from_secs(self.keepalive_interval.max(1))
+    }
+
+    fn keepalive_failures(&self) -> u8 {
+        self.keepalive_failures.max(1)
     }
 }
 
@@ -108,8 +279,14 @@ fn main() -> ExitCode {
 
 fn run() -> Result<()> {
     let args = Args::parse();
+
+    if let Some(command) = args.command.as_ref() {
+        return handle_cli_command(command);
+    }
+
     let timeout = Duration::from_secs(args.timeout);
 
+    ui::title("airadb", "Android wireless debugging companion");
     ui::status("Checking ADB...");
     let adb = Adb::resolve(args.adb.clone())?;
     adb.version()?;
@@ -126,43 +303,526 @@ fn run() -> Result<()> {
         StartupDeviceChoice::Close => return Ok(()),
     };
 
-    ui::status(format!("Connected to {}", phone.display_name));
-    handle_connected_phone(&phone, &args)
+    ui::success(format!("Connected to {}", phone.display_name));
+    let action = connected_phone_action(&args)?;
+    prepare_connected_phone(&adb, &phone, &args, action);
+    handle_connected_phone(&adb, &phone, &args, action)
 }
 
-fn handle_connected_phone(phone: &ConnectedPhone, args: &Args) -> Result<()> {
-    match args.scrcpy_launch_mode() {
-        ScrcpyLaunchMode::Menu => connected_phone_menu(phone, args),
-        ScrcpyLaunchMode::Background => start_scrcpy_background(phone, args),
-        ScrcpyLaunchMode::Foreground => start_scrcpy_foreground(phone, args),
+fn handle_cli_command(command: &CliCommand) -> Result<()> {
+    match command {
+        CliCommand::Completions(args) => print_completions(args),
+        CliCommand::InstallShell(args) => install_shell(args),
     }
 }
 
-fn connected_phone_menu(phone: &ConnectedPhone, args: &Args) -> Result<()> {
-    loop {
-        match ui::menu(&[
-            "Start scrcpy in background and close",
-            "Start scrcpy",
-            "Close",
-        ])? {
-            1 => return start_scrcpy_background(phone, args),
-            2 => start_scrcpy_foreground(phone, args)?,
-            3 => return Ok(()),
-            _ => unreachable!("ui::menu only returns a valid option"),
+fn print_completions(args: &CompletionArgs) -> Result<()> {
+    let mut command = Args::command().bin_name(args.name.as_str());
+    let mut stdout = io::stdout();
+
+    match args.shell {
+        CompletionShell::Zsh => {
+            clap_complete::generate(Shell::Zsh, &mut command, args.name.as_str(), &mut stdout);
         }
+    }
+
+    Ok(())
+}
+
+fn install_shell(args: &InstallShellArgs) -> Result<()> {
+    let airadb_path = airadb_binary_path(args.bin_dir.as_deref())?;
+    let bin_dir = args
+        .bin_dir
+        .clone()
+        .or_else(|| airadb_path.parent().map(Path::to_path_buf))
+        .context("could not resolve the airadb binary directory")?;
+    fs::create_dir_all(&bin_dir)
+        .with_context(|| format!("failed to create {}", bin_dir.display()))?;
+
+    let alias_path = bin_dir.join(ALIAS_NAME);
+    install_alias(&airadb_path, &alias_path, args.force)?;
+
+    let completion_dir = zsh_completion_dir(args.zsh_completion_dir.as_deref())?;
+    install_zsh_completion(CompletionName::Airadb, &completion_dir)?;
+    install_zsh_completion(CompletionName::Aw, &completion_dir)?;
+
+    ui::success(format!(
+        "Installed `{ALIAS_NAME}` alias at {} ({ALIAS_MEMORY}).",
+        alias_path.display()
+    ));
+    ui::success(format!(
+        "Installed zsh completions in {}.",
+        completion_dir.display()
+    ));
+
+    if !zsh_fpath_contains(&completion_dir) {
+        ui::warn(format!(
+            "zsh may not load completions until this is in fpath: fpath=({} $fpath)",
+            shell_quote(&completion_dir)
+        ));
+    }
+
+    Ok(())
+}
+
+fn airadb_binary_path(bin_dir: Option<&Path>) -> Result<PathBuf> {
+    if let Some(bin_dir) = bin_dir {
+        let installed_path = bin_dir.join(BINARY_NAME);
+        if installed_path.exists() {
+            return Ok(installed_path);
+        }
+    }
+
+    env::current_exe().context("could not resolve the current executable path")
+}
+
+fn install_alias(airadb_path: &Path, alias_path: &Path, force: bool) -> Result<()> {
+    if symlink_metadata(alias_path).is_some() {
+        if path_points_to(alias_path, airadb_path) {
+            return Ok(());
+        }
+
+        if !force {
+            bail!(
+                "{} already exists. Re-run with --force to replace it.",
+                alias_path.display()
+            );
+        }
+
+        remove_alias(alias_path)?;
+    }
+
+    create_alias_symlink(airadb_path, alias_path)
+        .with_context(|| format!("failed to create {}", alias_path.display()))
+}
+
+fn symlink_metadata(path: &Path) -> Option<fs::Metadata> {
+    fs::symlink_metadata(path).ok()
+}
+
+fn remove_alias(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {}", path.display()))?;
+
+    if metadata.is_dir() && !metadata.file_type().is_symlink() {
+        bail!("{} is a directory; refusing to replace it", path.display());
+    }
+
+    fs::remove_file(path).with_context(|| format!("failed to remove {}", path.display()))
+}
+
+#[cfg(unix)]
+fn create_alias_symlink(airadb_path: &Path, alias_path: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(airadb_path, alias_path)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_alias_symlink(airadb_path: &Path, alias_path: &Path) -> Result<()> {
+    fs::copy(airadb_path, alias_path)?;
+    Ok(())
+}
+
+fn path_points_to(path: &Path, target: &Path) -> bool {
+    if let Ok(link_target) = fs::read_link(path) {
+        if link_target == target {
+            return true;
+        }
+
+        if let Some(parent) = path.parent() {
+            if parent.join(link_target) == target {
+                return true;
+            }
+        }
+    }
+
+    match (fs::canonicalize(path), fs::canonicalize(target)) {
+        (Ok(path), Ok(target)) => path == target,
+        _ => false,
+    }
+}
+
+fn zsh_completion_dir(override_dir: Option<&Path>) -> Result<PathBuf> {
+    if let Some(dir) = override_dir {
+        fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+        return Ok(dir.to_path_buf());
+    }
+
+    if let Some(dir) = writable_zsh_fpath_dir() {
+        return Ok(dir);
+    }
+
+    let dir = home_dir().join(".zfunc");
+    fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    Ok(dir)
+}
+
+fn writable_zsh_fpath_dir() -> Option<PathBuf> {
+    zsh_fpath_dirs()
+        .into_iter()
+        .find(|path| is_writable_directory(path))
+}
+
+fn zsh_fpath_contains(dir: &Path) -> bool {
+    let canonical_dir = fs::canonicalize(dir).ok();
+
+    zsh_fpath_dirs().iter().any(|entry| {
+        if entry == dir {
+            return true;
+        }
+
+        match (&canonical_dir, fs::canonicalize(entry).ok()) {
+            (Some(dir), Some(entry)) => dir == &entry,
+            _ => false,
+        }
+    })
+}
+
+fn zsh_fpath_dirs() -> Vec<PathBuf> {
+    let Ok(output) = ProcessCommand::new("zsh")
+        .args(["-lc", "print -rC1 -- $fpath"])
+        .output()
+    else {
+        return Vec::new();
+    };
+
+    if !output.status.success() {
+        return Vec::new();
+    }
+
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(PathBuf::from)
+        .collect()
+}
+
+fn is_writable_directory(path: &Path) -> bool {
+    if !path.is_dir() {
+        return false;
+    }
+
+    let test_path = path.join(format!(".airadb-write-test-{}", std::process::id()));
+
+    match fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&test_path)
+    {
+        Ok(_) => {
+            let _ = fs::remove_file(test_path);
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+fn install_zsh_completion(name: CompletionName, dir: &Path) -> Result<()> {
+    fs::create_dir_all(dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    let file = dir.join(format!("_{}", name.as_str()));
+    fs::write(&file, zsh_completion(name))
+        .with_context(|| format!("failed to write {}", file.display()))
+}
+
+fn zsh_completion(name: CompletionName) -> Vec<u8> {
+    let mut command = Args::command().bin_name(name.as_str());
+    let mut buffer = Vec::new();
+    clap_complete::generate(Shell::Zsh, &mut command, name.as_str(), &mut buffer);
+    buffer
+}
+
+fn home_dir() -> PathBuf {
+    env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn shell_quote(path: &Path) -> String {
+    let value = path.display().to_string();
+
+    if value.chars().all(|character| {
+        character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-')
+    }) {
+        return value;
+    }
+
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+fn prepare_connected_phone(
+    adb: &Adb,
+    phone: &ConnectedPhone,
+    args: &Args,
+    action: ConnectedAction,
+) {
+    if should_request_stay_awake(args, action) {
+        match adb.stay_awake(&phone.serial) {
+            Ok(()) => ui::success("Requested Android stay-awake mode."),
+            Err(error) => ui::warn(format!(
+                "could not enable Android stay-awake mode: {error:#}"
+            )),
+        }
+    }
+
+    if args.wifi_doctor_enabled() {
+        let mut last_wifi_status = None;
+        report_wifi_status(adb, &phone.serial, &mut last_wifi_status);
+    }
+}
+
+fn handle_connected_phone(
+    adb: &Adb,
+    phone: &ConnectedPhone,
+    args: &Args,
+    action: ConnectedAction,
+) -> Result<()> {
+    if args.watch_enabled() {
+        return match action {
+            ConnectedAction::StartBackground => {
+                watch_connected_phone(adb, phone, args, Some(ScrcpyRunMode::Background))
+            }
+            ConnectedAction::StartForeground => {
+                watch_connected_phone(adb, phone, args, Some(ScrcpyRunMode::Foreground))
+            }
+            ConnectedAction::Close => Ok(()),
+        };
+    }
+
+    match action {
+        ConnectedAction::StartBackground => start_scrcpy_background(phone, args),
+        ConnectedAction::StartForeground => start_scrcpy_foreground(phone, args),
+        ConnectedAction::Close => Ok(()),
+    }
+}
+
+fn should_request_stay_awake(args: &Args, action: ConnectedAction) -> bool {
+    args.keep_screen_awake_enabled() || action.starts_scrcpy()
+}
+
+fn connected_phone_action(args: &Args) -> Result<ConnectedAction> {
+    match args.scrcpy_launch_mode() {
+        ScrcpyLaunchMode::Background => return Ok(ConnectedAction::StartBackground),
+        ScrcpyLaunchMode::Foreground => return Ok(ConnectedAction::StartForeground),
+        ScrcpyLaunchMode::Menu => {}
+    }
+
+    let background_label = if args.watch_enabled() {
+        "Start scrcpy in background and watch"
+    } else {
+        "Start scrcpy in background and close"
+    };
+
+    match ui::menu(&[background_label, "Start scrcpy", "Close"])? {
+        1 => Ok(ConnectedAction::StartBackground),
+        2 => Ok(ConnectedAction::StartForeground),
+        3 => Ok(ConnectedAction::Close),
+        _ => unreachable!("ui::menu only returns a valid option"),
     }
 }
 
 fn start_scrcpy_background(phone: &ConnectedPhone, args: &Args) -> Result<()> {
     let scrcpy = resolve_scrcpy(args)?;
-    let pid = scrcpy.launch_background(&phone.serial)?;
-    ui::status(format!("Started scrcpy in the background (pid {pid})."));
+    let pid = scrcpy.launch_background(&phone.serial, &args.scrcpy_options())?;
+    ui::success(format!("Started scrcpy in the background (pid {pid})."));
     Ok(())
 }
 
 fn start_scrcpy_foreground(phone: &ConnectedPhone, args: &Args) -> Result<()> {
     let scrcpy = resolve_scrcpy(args)?;
-    scrcpy.launch(&phone.serial)
+    scrcpy.launch(&phone.serial, &args.scrcpy_options())
+}
+
+fn watch_connected_phone(
+    adb: &Adb,
+    phone: &ConnectedPhone,
+    args: &Args,
+    scrcpy_mode: Option<ScrcpyRunMode>,
+) -> Result<()> {
+    ui::section(
+        "Watch mode",
+        [
+            "Sending ADB keepalives to detect stale wireless transports.",
+            "When the device drops, airadb tries adb reconnect and mDNS endpoints.",
+            "Press either ⌃ + C, ESC, C or X to stop watching.",
+        ],
+    );
+
+    let scrcpy = if scrcpy_mode.is_some() {
+        Some(resolve_scrcpy(args)?)
+    } else {
+        None
+    };
+    let scrcpy_options = args.scrcpy_options();
+    let mut serial = phone.serial.clone();
+    let mut child = match (&scrcpy, scrcpy_mode) {
+        (Some(scrcpy), Some(mode)) => Some(spawn_supervised_scrcpy(
+            scrcpy,
+            &serial,
+            &scrcpy_options,
+            mode,
+        )?),
+        _ => None,
+    };
+    let mut failed_keepalives = 0;
+    let mut last_wifi_status = None;
+
+    loop {
+        if let Some(scrcpy_child) = child.as_mut() {
+            if let Some(status) = scrcpy_child
+                .try_wait()
+                .context("failed to check scrcpy status")?
+            {
+                ui::warn(format!(
+                    "scrcpy exited with status {status}; it will restart when ADB is ready."
+                ));
+                child = None;
+            }
+        }
+
+        match adb.keepalive(&serial) {
+            Ok(()) => {
+                if failed_keepalives > 0 {
+                    ui::success("ADB keepalive recovered.");
+                }
+
+                failed_keepalives = 0;
+
+                if args.wifi_doctor_enabled() {
+                    report_wifi_status(adb, &serial, &mut last_wifi_status);
+                }
+
+                if child.is_none() {
+                    if let (Some(scrcpy), Some(mode)) = (&scrcpy, scrcpy_mode) {
+                        child = Some(spawn_supervised_scrcpy(
+                            scrcpy,
+                            &serial,
+                            &scrcpy_options,
+                            mode,
+                        )?);
+                    }
+                }
+            }
+            Err(error) => {
+                failed_keepalives += 1;
+                ui::warn(format!(
+                    "ADB keepalive failed ({failed_keepalives}/{}): {error:#}",
+                    args.keepalive_failures()
+                ));
+
+                if failed_keepalives >= args.keepalive_failures() {
+                    match reconnect_watched_phone(adb, &serial) {
+                        Ok(reconnected) => {
+                            serial = reconnected.serial;
+                            failed_keepalives = 0;
+                            last_wifi_status = None;
+                            ui::success(format!(
+                                "Watch mode reconnected to {}",
+                                reconnected.display_name
+                            ));
+                        }
+                        Err(reconnect_error) => {
+                            ui::warn(format!("automatic reconnect failed: {reconnect_error:#}"));
+                        }
+                    }
+                }
+            }
+        }
+
+        ui::sleep_or_cancel(args.keepalive_interval())?;
+    }
+}
+
+fn spawn_supervised_scrcpy(
+    scrcpy: &Scrcpy,
+    serial: &str,
+    options: &ScrcpyOptions,
+    mode: ScrcpyRunMode,
+) -> Result<Child> {
+    let child = scrcpy.spawn(serial, options, mode)?;
+    ui::success(format!("Started supervised scrcpy (pid {}).", child.id()));
+    Ok(child)
+}
+
+fn reconnect_watched_phone(adb: &Adb, current_serial: &str) -> Result<ConnectedPhone> {
+    ui::status("Trying to reconnect wireless ADB...");
+    let _ = adb.reconnect_offline();
+
+    if let Some(phone) = ready_phone_matching(adb, current_serial)? {
+        return Ok(phone);
+    }
+
+    let timeout = Duration::from_secs(10);
+    let baseline_devices = HashSet::new();
+
+    if is_plausible_endpoint(current_serial) {
+        if let Ok(device) = connect_to_endpoint(adb, current_serial, &baseline_devices, timeout) {
+            return Ok(ConnectedPhone {
+                serial: device.serial.clone(),
+                display_name: device.display_name(),
+            });
+        }
+    }
+
+    for endpoint in reconnect_endpoints(adb, current_serial) {
+        match connect_to_endpoint(adb, &endpoint, &baseline_devices, timeout) {
+            Ok(device) => {
+                return Ok(ConnectedPhone {
+                    serial: device.serial.clone(),
+                    display_name: device.display_name(),
+                });
+            }
+            Err(error) => ui::warn(format!("reconnect endpoint {endpoint} failed: {error:#}")),
+        }
+    }
+
+    bail!("no reconnectable wireless debugging endpoint was found")
+}
+
+fn ready_phone_matching(adb: &Adb, expected_serial: &str) -> Result<Option<ConnectedPhone>> {
+    let baseline_devices = HashSet::new();
+    let devices = adb.devices()?;
+
+    Ok(
+        adb::matching_ready_device(&devices, expected_serial, &baseline_devices).map(|device| {
+            ConnectedPhone {
+                serial: device.serial.clone(),
+                display_name: device.display_name(),
+            }
+        }),
+    )
+}
+
+fn reconnect_endpoints(adb: &Adb, current_serial: &str) -> Vec<String> {
+    let host = adb::endpoint_host(current_serial);
+    let services = adb.mdns_services().unwrap_or_default();
+    let connect_endpoints: Vec<String> = services
+        .iter()
+        .filter(|service| service.is_connect_service())
+        .map(|service| service.address.clone())
+        .collect();
+
+    let same_host: Vec<String> = connect_endpoints
+        .iter()
+        .filter(|endpoint| adb::endpoint_host(endpoint) == host)
+        .cloned()
+        .collect();
+
+    if same_host.is_empty() {
+        connect_endpoints
+    } else {
+        same_host
+    }
+}
+
+fn report_wifi_status(adb: &Adb, serial: &str, last_status: &mut Option<String>) {
+    match adb.wifi_status(serial) {
+        Ok(status) if last_status.as_deref() != Some(status.as_str()) => {
+            ui::status(format!("Wi-Fi: {status}"));
+            *last_status = Some(status);
+        }
+        Ok(_) => {}
+        Err(error) => ui::warn(format!("could not read Wi-Fi status: {error:#}")),
+    }
 }
 
 fn resolve_scrcpy(args: &Args) -> Result<Scrcpy> {
@@ -177,7 +837,7 @@ fn startup_device_choice(adb: &Adb) -> Result<StartupDeviceChoice> {
         0 => Ok(StartupDeviceChoice::PairNew),
         1 => {
             let phone = ready_phones[0].clone();
-            ui::status(format!(
+            ui::success(format!(
                 "ADB is already connected to {}.",
                 phone.display_name
             ));
@@ -253,7 +913,7 @@ fn warn_if_mdns_check_fails(adb: &Adb) {
 fn reset_adb_server(adb: &Adb) -> Result<()> {
     ui::status("Resetting local ADB server...");
     adb.reset_server()?;
-    ui::status("ADB server restarted.");
+    ui::success("ADB server restarted.");
     Ok(())
 }
 
@@ -263,7 +923,7 @@ fn retrying_pairing_flow(adb: &Adb, timeout: Duration) -> Result<ConnectedPhone>
             Ok(phone) => return Ok(phone),
             Err(error) => {
                 if ui::is_cancelled(&error) {
-                    ui::status("Pairing cancelled.");
+                    ui::success("Pairing cancelled.");
                 } else {
                     ui::error(format!("{error:#}"));
                 }
@@ -320,19 +980,27 @@ fn manual_connect_device(
     baseline_devices: &HashSet<String>,
     timeout: Duration,
 ) -> Result<adb::AdbDevice> {
-    ui::status("On your Android phone:");
-    ui::status("Go back to the main Wireless debugging screen.");
-    ui::status("Copy the value shown as \"IP address & Port\".");
+    ui::section(
+        "Manual connection",
+        [
+            "On your Android phone, go back to the main Wireless debugging screen.",
+            "Copy the value shown as \"IP address & Port\".",
+        ],
+    );
 
     let endpoint = prompt_endpoint("Enter phone IP:port")?;
     connect_to_endpoint(adb, &endpoint, baseline_devices, timeout)
 }
 
 fn pairing_code_flow(adb: &Adb, timeout: Duration) -> Result<ConnectedPhone> {
-    ui::status("On your Android phone:");
-    ui::status("Go to Developer options -> Wireless debugging.");
-    ui::status("Tap \"Pair device with pairing code\".");
-    ui::status("Enter the pairing IP:port and pairing code shown on the phone.");
+    ui::section(
+        "Pair with pairing code",
+        [
+            "On your Android phone, go to Developer options -> Wireless debugging.",
+            "Tap \"Pair device with pairing code\".",
+            "Enter the pairing IP:port and pairing code shown on the phone.",
+        ],
+    );
 
     let pairing_endpoint = prompt_endpoint("Enter pairing IP:port")?;
     let pairing_code = ui::prompt_required("Enter pairing code")?;
@@ -340,9 +1008,14 @@ fn pairing_code_flow(adb: &Adb, timeout: Duration) -> Result<ConnectedPhone> {
     ui::status(format!("Pairing with {pairing_endpoint}..."));
     adb.pair(&pairing_endpoint, &pairing_code)?;
 
-    ui::status("Pairing succeeded.");
-    ui::status("Close the pairing-code dialog on the phone.");
-    ui::status("On the main Wireless debugging screen, copy \"IP address & Port\".");
+    ui::success("Pairing succeeded.");
+    ui::section(
+        "Connect paired phone",
+        [
+            "Close the pairing-code dialog on the phone.",
+            "On the main Wireless debugging screen, copy \"IP address & Port\".",
+        ],
+    );
 
     let connect_endpoint = prompt_endpoint("Enter phone IP:port")?;
     let baseline_devices = adb::ready_device_serials(&adb.devices().unwrap_or_default());
@@ -362,7 +1035,7 @@ fn prompt_endpoint(label: &str) -> Result<String> {
             return Ok(endpoint);
         }
 
-        ui::status("Use the full value shown on the phone, for example 192.168.68.54:37123.");
+        ui::warn("Use the full value shown on the phone, for example 192.168.68.54:37123.");
     }
 }
 
@@ -415,7 +1088,7 @@ fn wait_for_ready_device(
             baseline_devices,
         ) {
             countdown.finish();
-            ui::status(format!("ADB device is ready: {}", device.display_name()));
+            ui::success(format!("ADB device is ready: {}", device.display_name()));
             return Ok(device);
         }
 
@@ -436,11 +1109,14 @@ fn pair_and_connect(adb: &Adb, timeout: Duration) -> Result<ConnectedPhone> {
     let baseline_devices = adb::ready_device_serials(&adb.devices().unwrap_or_default());
     let qr = PairingQr::generate();
 
-    ui::status("On your Android phone:");
-    ui::status("Go to Developer options -> Wireless debugging.");
-    ui::status("Tap \"Pair device with QR code\".");
-    ui::status("Scan the QR code below.");
-    ui::blank_line();
+    ui::section(
+        "Pair with QR code",
+        [
+            "On your Android phone, go to Developer options -> Wireless debugging.",
+            "Tap \"Pair device with QR code\".",
+            "Scan the QR code below.",
+        ],
+    );
     ui::print_qr(&qr.render_terminal()?);
     ui::blank_line();
     ui::status(ui::CANCEL_HINT);
@@ -450,7 +1126,7 @@ fn pair_and_connect(adb: &Adb, timeout: Duration) -> Result<ConnectedPhone> {
         PairingWaitOutcome::AlreadyConnected(phone) => return Ok(phone),
     };
 
-    ui::status("Phone found. Completing ADB pairing...");
+    ui::success("Phone found. Completing ADB pairing...");
     adb.pair(&pairing_address, &qr.secret)?;
 
     ui::status("Looking for the wireless debugging connection endpoint...");
@@ -533,7 +1209,7 @@ fn wait_for_pairing_endpoint(
         match dnssd::discover_pairing_endpoint(instance, Duration::from_secs(2)) {
             Ok(Some(endpoint)) => {
                 countdown.finish();
-                ui::status("Phone found through macOS Bonjour.");
+                ui::success("Phone found through macOS Bonjour.");
                 return Ok(PairingWaitOutcome::PairingEndpoint(endpoint));
             }
             Ok(None) => {}
@@ -567,7 +1243,7 @@ fn already_connected_phone_choice(
         0 => Ok(None),
         1 => {
             let phone = ready_phones[0].clone();
-            ui::status(format!(
+            ui::success(format!(
                 "ADB already sees {}; skipping QR scan.",
                 phone.display_name
             ));
@@ -622,7 +1298,7 @@ fn connect_and_wait_for_device(
             adb::matching_ready_device(&ready_devices, &expected_serial, baseline_devices)
         {
             countdown.finish();
-            ui::status(format!("ADB device is ready: {}", device.display_name()));
+            ui::success(format!("ADB device is ready: {}", device.display_name()));
             return Ok(device);
         }
 
@@ -956,8 +1632,109 @@ mod tests {
     }
 
     #[test]
+    fn stable_mode_enables_supervision_defaults() {
+        let args = Args::try_parse_from(["airadb", "--stable"]).unwrap();
+
+        assert_eq!(args.scrcpy_launch_mode(), ScrcpyLaunchMode::Background);
+        assert!(args.watch_enabled());
+        assert!(args.keep_screen_awake_enabled());
+        assert!(args.wifi_doctor_enabled());
+    }
+
+    #[test]
+    fn scrcpy_actions_request_stay_awake_by_default() {
+        let args = Args::try_parse_from(["airadb"]).unwrap();
+
+        assert!(should_request_stay_awake(
+            &args,
+            ConnectedAction::StartBackground
+        ));
+        assert!(should_request_stay_awake(
+            &args,
+            ConnectedAction::StartForeground
+        ));
+        assert!(!should_request_stay_awake(&args, ConnectedAction::Close));
+    }
+
+    #[test]
+    fn explicit_keep_screen_awake_applies_without_scrcpy() {
+        let args = Args::try_parse_from(["airadb", "--keep-screen-awake"]).unwrap();
+
+        assert!(should_request_stay_awake(&args, ConnectedAction::Close));
+    }
+
+    #[test]
+    fn normalizes_keepalive_settings() {
+        let args = Args::try_parse_from([
+            "airadb",
+            "--watch",
+            "--keepalive-interval",
+            "0",
+            "--keepalive-failures",
+            "0",
+        ])
+        .unwrap();
+
+        assert_eq!(args.keepalive_interval(), Duration::from_secs(1));
+        assert_eq!(args.keepalive_failures(), 1);
+    }
+
+    #[test]
+    fn builds_scrcpy_options_from_args() {
+        let default_args = Args::try_parse_from(["airadb"]).unwrap();
+        assert_eq!(default_args.scrcpy_options(), ScrcpyOptions::default());
+
+        let custom_args = Args::try_parse_from([
+            "airadb",
+            "--plain-window",
+            "--always-on-top",
+            "--window-title",
+            "Ovi Pixel",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            custom_args.scrcpy_options(),
+            ScrcpyOptions {
+                borderless: false,
+                always_on_top: true,
+                window_title: "Ovi Pixel".to_string(),
+                ..ScrcpyOptions::default()
+            }
+        );
+    }
+
+    #[test]
     fn rejects_conflicting_scrcpy_launch_flags() {
         assert!(Args::try_parse_from(["airadb", "--background", "--foreground"]).is_err());
+    }
+
+    #[test]
+    fn parses_shell_integration_commands() {
+        let args = Args::try_parse_from(["airadb", "completions", "zsh", "--name", "aw"]).unwrap();
+
+        match args.command {
+            Some(CliCommand::Completions(args)) => {
+                assert_eq!(args.shell, CompletionShell::Zsh);
+                assert_eq!(args.name, CompletionName::Aw);
+            }
+            _ => panic!("expected completions command"),
+        }
+
+        let args = Args::try_parse_from(["airadb", "install-shell", "--force"]).unwrap();
+
+        match args.command {
+            Some(CliCommand::InstallShell(args)) => assert!(args.force),
+            _ => panic!("expected install-shell command"),
+        }
+    }
+
+    #[test]
+    fn generates_zsh_completion_for_aw_alias() {
+        let completion = String::from_utf8(zsh_completion(CompletionName::Aw)).unwrap();
+
+        assert!(completion.contains("#compdef aw"));
+        assert!(completion.contains("install-shell"));
     }
 
     #[test]
